@@ -211,29 +211,48 @@ object Resolver {
       }
     }
 
+    // Expand a Require-Bundle closure. Selection is "first constraint wins", with selection split
+    // from recursion (via `closureProcessed`) so a bundle pre-selected in phase 1 below still has
+    // its own requires expanded.
+    val closureProcessed = HashSet<String>()
     fun addRequireWithClosure(bsn: String, range: VersionRange) {
       if (!selected.containsKey(bsn)) {
         val cand = select(bsn, range)
-        if (cand != null) {
-          selected.putIfAbsent(bsn, cand)
-          val requiresAll = if (cand.origin == BundleOrigin.WORKSPACE) {
-            cand.manifest.requiredBundleAndVersion(includeOptional = true) +
-              cand.manifest.reexportRequiredBundleAndVersion(includeOptional = true)
-          } else {
-            val nav = target.requiresByBundle()[cand.bsn]?.get(cand.version) ?: emptyMap()
-            nav + cand.manifest.reexportRequiredBundleAndVersion(includeOptional = true)
-          }
-          requiresAll.forEach { (childBsn, childRange) -> addRequireWithClosure(childBsn, childRange) }
-        } else {
+        if (cand == null) {
           unresolved.add(UnresolvedBundle(bsn, range, "require-bundle"))
+          return
         }
+        selected[bsn] = cand
       }
+      if (!closureProcessed.add(bsn)) return
+      val cand = selected[bsn] ?: return
+      val requiresAll = if (cand.origin == BundleOrigin.WORKSPACE) {
+        cand.manifest.requiredBundleAndVersion(includeOptional = true) +
+          cand.manifest.reexportRequiredBundleAndVersion(includeOptional = true)
+      } else {
+        val nav = target.requiresByBundle()[cand.bsn]?.get(cand.version) ?: emptyMap()
+        nav + cand.manifest.reexportRequiredBundleAndVersion(includeOptional = true)
+      }
+      requiresAll.forEach { (childBsn, childRange) -> addRequireWithClosure(childBsn, childRange) }
     }
 
     val requires = LinkedHashMap(entry.manifest.requiredBundleAndVersion(includeOptional = true))
     fragmentHostCandidate?.manifest?.requiredBundleAndVersion(includeOptional = true)?.forEach { (bsn, range) ->
       requires.putIfAbsent(bsn, range)
     }
+    // Phase 1: lock the entry's (and fragment host's) DIRECT Require-Bundle constraints at their own
+    // ranges before expanding the transitive closure. When the target ships several versions of a
+    // library, a transitive path that requires it at a wider range (e.g. another bundle wanting
+    // Guava 33 while this one declares `[19,20)`) would otherwise grab the global-highest version
+    // first, and this bundle would compile against a newer library than its declared range binds at
+    // launch -> NoSuchMethodError. Equinox wires each bundle to its own range, so the compile
+    // classpath must match.
+    requires.forEach { (bsn, range) ->
+      if (!selected.containsKey(bsn)) {
+        select(bsn, range)?.let { selected[bsn] = it }
+      }
+    }
+    // Phase 2: expand the full transitive closure (recurses even into phase-1-selected bundles).
     requires.forEach { (bsn, range) -> addRequireWithClosure(bsn, range) }
 
     val imports = LinkedHashMap(entry.manifest.importedPackageAndVersion())
@@ -332,13 +351,37 @@ object Resolver {
         }
       }
 
-      val nav = tpProvidersByPkg[pkg] ?: return null
-      val provider = nav.descendingMap().entries.asSequence().mapNotNull { e ->
-        val man = e.value.manifest
-        val ver = exportsOf(man)[pkg]
-        if (ver != null && range.includes(ver)) pinnedProviderCandidate(e.value, pkg, range) else null
+      val nav = tpProvidersByPkg[pkg]
+      if (nav != null) {
+        val provider = nav.descendingMap().entries.asSequence().mapNotNull { e ->
+          val man = e.value.manifest
+          val ver = exportsOf(man)[pkg]
+          if (ver != null && range.includes(ver)) pinnedProviderCandidate(e.value, pkg, range) else null
+        }.firstOrNull()
+        if (provider != null) return provider
+      }
+      // Fall back to the full target index for packages not in the precomputed entry/host import
+      // set — e.g. packages imported only by a Require-Bundle-closure member (see the indirect
+      // Import-Package closure below). Range-checks the package export version, mirroring the
+      // tpProvidersByPkg branch.
+      val navAll = target.exportedBundlesByPackageNav()[pkg] ?: return null
+      return navAll.descendingMap().entries.asSequence().mapNotNull { e ->
+        val rb = e.value
+        val man = rb.manifest
+        val ver = exportsOf(man)[pkg] ?: return@mapNotNull null
+        if (!range.includes(ver)) return@mapNotNull null
+        val bsn = man.bundleSymbolicName?.key ?: return@mapNotNull null
+        val prov = PkgProvider(
+          bsn,
+          e.key,
+          rb.location,
+          man,
+          BundleOrigin.TARGET,
+          computeTargetClassPathEntries(rb, target),
+          computeTargetSourceEntries(rb, target)
+        )
+        pinnedProviderCandidate(prov, pkg, range)
       }.firstOrNull()
-      return provider
     }
 
     imports.forEach { (pkg, range) ->
@@ -347,6 +390,40 @@ object Resolver {
         selected[provider.bsn] = provider
       } else if (provider == null) {
         unresolved.add(UnresolvedBundle(pkg, range, "import-package"))
+      }
+    }
+
+    // Indirectly-required Import-Package exporters: a Require-Bundle-closure member's API may
+    // reference a type from a package it only Imports (not Re-exports / Require-Bundles), e.g.
+    // junit-jupiter-api -> org.opentest4j. Import-Package is otherwise resolved only for the
+    // entry + fragment host, so that exporter is never selected and ecj reports the type as
+    // "indirectly referenced from required type". Expand the closure's mandatory imports to a
+    // fixpoint (each newly-added exporter is processed too, covering deeper chains), bounded by
+    // "package already provided by the selection".
+    run {
+      val providedPackages = HashSet<String>()
+      selected.values.forEach { providedPackages += exportsOf(it.manifest).keys }
+      val worklist = ArrayDeque(selected.keys.filter { it != entrySymbolicName })
+      val processed = HashSet<String>()
+      while (worklist.isNotEmpty()) {
+        val bsn = worklist.removeFirst()
+        if (!processed.add(bsn)) continue
+        val manifest = selected[bsn]?.manifest ?: continue
+        manifest.importedPackageAndVersion().forEach forEachPkg@{ (pkg, range) ->
+          if (pkg.startsWith("java.") || pkg in providedPackages) return@forEachPkg
+          val provider = findProviderForPackage(pkg, range)
+          if (provider == null) {
+            unresolved.add(UnresolvedBundle(pkg, range, "import-package-indirect"))
+            return@forEachPkg
+          }
+          // Consistency-first: if this BSN is already selected (possibly at another version),
+          // keep the existing selection rather than putting a second copy on the classpath.
+          if (!selected.containsKey(provider.bsn)) {
+            selected[provider.bsn] = provider
+            worklist.add(provider.bsn)
+          }
+          providedPackages += exportsOf(provider.manifest).keys
+        }
       }
     }
 
@@ -408,7 +485,7 @@ object Resolver {
     val problems = directProblems + unresolved.map { u ->
       val type = when (u.reason) {
         "fragmentHost" -> ResolveProblemType.FRAGMENT_HOST
-        "import-package" -> ResolveProblemType.MISSING_PACKAGE
+        "import-package", "import-package-indirect" -> ResolveProblemType.MISSING_PACKAGE
         else -> ResolveProblemType.MISSING_BUNDLE
       }
       ResolveProblem(type, u.bsn, u.range, u.reason)
