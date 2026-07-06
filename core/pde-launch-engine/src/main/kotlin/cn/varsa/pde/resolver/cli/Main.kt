@@ -1752,25 +1752,35 @@ private fun executeLaunch(
   } else {
     processBuilder.redirectErrorStream(true)
   }
-  val process = processBuilder
-    .directory(prepared.layout.workDir.toFile())
-    .start()
-  val outputThread = if (outputLog == null) {
-    Thread {
-      process.inputStream.use { input -> input.copyTo(System.out) }
-    }.also { thread ->
-      thread.isDaemon = true
-      thread.start()
+  // Relaunch on Eclipse's restart exit codes (23 = EXIT_RESTART, 24 = EXIT_RELAUNCH), the same way the native
+  // Eclipse launcher does, so an in-AP `IWorkbench.restart()` (e.g. the wf-mcp `shutdown` tool) actually brings the
+  // AP back up instead of being reported as a launcher failure. Re-runs the same command (picks up rebuilt bin +
+  // manifest on the new boot).
+  var exit: Int
+  do {
+    val process = processBuilder
+      .directory(prepared.layout.workDir.toFile())
+      .start()
+    val outputThread = if (outputLog == null) {
+      Thread {
+        process.inputStream.use { input -> input.copyTo(System.out) }
+      }.also { thread ->
+        thread.isDaemon = true
+        thread.start()
+      }
+    } else {
+      null
     }
-  } else {
-    null
-  }
-  val exit = process.waitFor()
-  outputThread?.join()
-  if (isSuccessfulCracCheckpointExit(exit, prepared.command, prepared.layout.workDir)) {
-    logger.info("Checkpoint completed; launcher exited with CRaC checkpoint code $exit")
-    return
-  }
+    exit = process.waitFor()
+    outputThread?.join()
+    if (isSuccessfulCracCheckpointExit(exit, prepared.command, prepared.layout.workDir)) {
+      logger.info("Checkpoint completed; launcher exited with CRaC checkpoint code $exit")
+      return
+    }
+    if (exit == 23 || exit == 24) {
+      logger.info("AP exited with code $exit (Eclipse restart/relaunch); relaunching")
+    }
+  } while (exit == 23 || exit == 24)
   if (exit != 0) error("Launcher exited with code $exit")
 }
 
