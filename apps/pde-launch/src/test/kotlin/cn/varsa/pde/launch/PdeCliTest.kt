@@ -59,15 +59,21 @@ class PdeCliTest {
     val lines = output.lines()
 
     // Nodes are prefixed with unicode box-drawing tree guides (├──/└──/│), indented under their
-    // parent's guide column rather than plain spaces.
-    assertTrue(lines.any { it == "├── target                   Target platform commands (install, mirror, inspect)" })
-    assertTrue(lines.any { it == "│   ├── install              Resolve/prepare target platform state" })
-    assertTrue(lines.any { it == "│   ├── repair               Repair reusable target bundle-pool state" })
-    assertTrue(lines.any { it == "│   │   ├── re-fetch         Re-run target install to fetch currently required artifacts" })
-    assertTrue(lines.any { it == "│   └── inspect              Inspect target profile state and health" })
-    assertTrue(lines.any { it == "│       ├── profile          Show profile location and bundle-pool basics" })
-    assertTrue(lines.any { it == "├── ide-init                 Generate IDE project files" })
-    assertTrue(lines.any { it == "│   ├── idea                 Generate IntelliJ project" })
+    // parent's guide column rather than plain spaces. The description column is matched with a
+    // flexible width: it is derived from the longest command name in the whole tree, so pinning
+    // the exact padding breaks every time a longer command is added.
+    fun assertTreeEntry(guides: String, description: String) {
+      val pattern = Regex("^" + Regex.escape(guides) + " {2,}" + Regex.escape(description) + "$")
+      assertTrue(lines.any { pattern.matches(it) }, "Expected tree entry '$guides ... $description'")
+    }
+    assertTreeEntry("├── target", "Target platform commands (install, mirror, inspect)")
+    assertTreeEntry("│   ├── install", "Resolve/prepare target platform state")
+    assertTreeEntry("│   ├── repair", "Repair reusable target bundle-pool state")
+    assertTreeEntry("│   │   ├── re-fetch", "Re-run target install to fetch currently required artifacts")
+    assertTreeEntry("│   └── inspect", "Inspect target profile state and health")
+    assertTreeEntry("│       ├── profile", "Show profile location and bundle-pool basics")
+    assertTreeEntry("├── ide-init", "Generate IDE project files")
+    assertTreeEntry("│   ├── idea", "Generate IntelliJ project")
   }
 
   @Test
@@ -258,7 +264,7 @@ class PdeCliTest {
 
     val output = out.toString()
     assertTrue(output.contains("Usage: pde target repair"))
-    assertTrue(output.contains("Usage: pde target install"))
+    assertTrue(output.contains("Usage: pde target repair re-fetch"))
     assertTrue(output.contains("Usage: pde target repair quarantine"))
     assertTrue(output.contains("Usage: pde target repair rebuild-index"))
   }
@@ -303,8 +309,10 @@ class PdeCliTest {
     assertTrue(output.contains("--report=String"))
     assertTrue(!output.contains("--all"))
     assertTrue(!output.contains("--include"))
-    assertTrue(output.contains("[testPos]"))
-    assertTrue(output.contains("defaults to all configured tests"))
+    // The positional is repeatable, so picocli renders it as [testPos...]; its description may
+    // be line-wrapped at any word boundary, so match it with normalized whitespace.
+    assertTrue(output.contains("[testPos...]"))
+    assertTrue(output.replace(Regex("\\s+"), " ").contains("defaults to all configured tests"))
   }
 
   @Test
@@ -379,18 +387,21 @@ class PdeCliTest {
   }
 
   @Test
-  fun `api filters add-from-report subcommand is routed through pde launcher`() {
+  fun `api baseline filters add-all-from-report subcommand is routed through pde launcher`() {
+    // The filter commands live under `pde api-baseline filters` since they were regrouped
+    // (there is no top-level `api-filters` command, and `add-from-report` became
+    // `add-all-from-report`).
     val out = ByteArrayOutputStream()
     val savedOut = System.out
     System.setOut(PrintStream(out))
     try {
-      runPde(arrayOf("api-filters", "add-from-report", "--help"))
+      runPde(arrayOf("api-baseline", "filters", "add-all-from-report", "--help"))
     } finally {
       System.setOut(savedOut)
     }
 
     val output = out.toString()
-    assertTrue(output.contains("Usage: pde api-filters add-from-report"))
+    assertTrue(output.contains("Usage: pde api-baseline filters add-all-from-report"))
     assertTrue(output.contains("--report=String"))
     assertTrue(output.contains("--problem=String"))
   }
