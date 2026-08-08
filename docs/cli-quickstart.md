@@ -87,5 +87,10 @@ and observe nice output:
 
 (Dont forget to compile first e.g. with `pde compile`)
 
+By default every test entry gets its own platform instance, so a suite of many small test classes
+spends most of its time starting the platform over and over. Set `testStrategy: merged` at the top
+level of `pde.yaml` (or pass `pde test --merged`) to run compatible entries in a single instance;
+see `docs/config-yaml.md` for what makes entries compatible.
+
 JaCoCo coverage can be collected by adding a JaCoCo `-javaagent` entry to `vmArgs`.
 See [the coverage notes](coverage.md) for the report-generation command.
