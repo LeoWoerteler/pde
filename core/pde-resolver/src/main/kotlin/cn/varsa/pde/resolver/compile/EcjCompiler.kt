@@ -6,6 +6,7 @@ import java.io.PrintWriter
 import java.nio.file.Files
 import cn.varsa.pde.resolver.workspace.WorkspaceDefaults
 import java.nio.file.Path
+import java.util.Properties
 import java.util.jar.JarFile
 import java.util.logging.Logger
 import kotlin.io.path.exists
@@ -62,6 +63,30 @@ class EcjCompiler(
     }
 
     val args = mutableListOf<String>()
+    // Feed the bundle's Eclipse compiler preferences (problem severities, null-analysis config,
+    // task tags, javadoc validation) to ECJ via -properties so diagnostics match what the IDE
+    // shows for this bundle. Only diagnostic configuration is forwarded: language levels and debug
+    // flags are owned by the explicit -source/-target/-g arguments below, and forwarding a
+    // compliance key would let the properties file contradict them.
+    val diagnosticPrefixes = listOf(
+      "org.eclipse.jdt.core.compiler.problem.",
+      "org.eclipse.jdt.core.compiler.annotation.",
+      "org.eclipse.jdt.core.compiler.taskTag",
+      "org.eclipse.jdt.core.compiler.taskPriorities",
+      "org.eclipse.jdt.core.compiler.taskCaseSensitive",
+      "org.eclipse.jdt.core.compiler.doc.comment.support"
+    )
+    val prefsEntries = spec.compilerPrefs.filterKeys { key -> diagnosticPrefixes.any { key.startsWith(it) } }
+    val prefsFile = if (prefsEntries.isEmpty()) null else {
+      Files.createTempFile("ecj-prefs-", ".properties").also { file ->
+        val properties = Properties()
+        prefsEntries.forEach { (key, value) -> properties.setProperty(key, value) }
+        Files.newOutputStream(file).use { properties.store(it, null) }
+      }
+    }
+    if (prefsFile != null) {
+      args += listOf("-properties", prefsFile.toString())
+    }
     args += listOf("-d", outDir.toString())
 
     val classpath = spec.classpath.filter { it.isNotBlank() }
@@ -110,7 +135,11 @@ class EcjCompiler(
     val baos = ByteArrayOutputStream()
     val writer = PrintWriter(baos, true)
     val compiler = Main(writer, writer, false, null, null)
-    val success = compiler.compile(args.toTypedArray())
+    val success = try {
+      compiler.compile(args.toTypedArray())
+    } finally {
+      prefsFile?.let { Files.deleteIfExists(it) }
+    }
 
     val output = buildString {
       classfileWarning?.let {
@@ -125,7 +154,9 @@ class EcjCompiler(
       success = success,
       output = output,
       durationMillis = 0,
-      skipped = false
+      skipped = false,
+      warningCount = compiler.globalWarningsCount,
+      infoCount = compiler.globalInfoCount
     )
   }
 

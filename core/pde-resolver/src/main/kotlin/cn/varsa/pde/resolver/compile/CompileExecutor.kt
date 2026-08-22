@@ -14,7 +14,9 @@ data class BundleCompileResult(
   val success: Boolean,
   val output: String,
   val durationMillis: Long,
-  val skipped: Boolean
+  val skipped: Boolean,
+  val warningCount: Int = 0,
+  val infoCount: Int = 0
 )
 
 object CompileExecutor {
