@@ -152,6 +152,7 @@ class LaunchCliTest {
 
   @Test
   fun restartExitCodeRelaunchesAndKeepsTheLogOfEveryRun() {
+    assumePosixShell()
     val root = tmp.root.toPath()
     val workspace = tmp.newFolder("workspace").also {
       createBundle(it, "org.example.app", "1.0.0", require = "org.eclipse.osgi")
